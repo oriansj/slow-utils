@@ -35,6 +35,7 @@
 (define AMD64 2)
 (define ARMV7L 40)
 (define AARM64 80)
+(define default-toggle #f)
 (define EXIT_FAILURE 1)
 
 ;; Globals
@@ -146,13 +147,23 @@
 ;; Lookup the address of labels
 (define (get-target name)
   (let ((node jump_table)
-		(i (car jump_table)))
+		(i '()))
 	(while (not (null? node))
-		   (if (string= name (entry-name i))
-			   (break (entry-target i))
-			   (begin
-				 (set! node (cdr node))
-				 (set! i (car node)))))))
+		   (begin
+			 (set! i (car node))
+			 (if (string= name (entry-name i))
+				 ;; Found it
+				 (break (entry-target i))
+				 (begin
+				   (set! node (cdr node))
+				   ;; Deal with fallthrough case
+				   (when (null? node)
+					 (begin
+					   (display "Target label " (current-error-port))
+					   (display name (current-error-port))
+					   (display " is not valid" (current-error-port))
+					   (newline (current-error-port))
+					   (exit EXIT_FAILURE)))))))))
 
 ;; Use architecture specific rules to determine
 ;; Proper displacement
@@ -161,15 +172,64 @@
    ((= Architecture KNIGHT) (- target base))
    ((= Architecture X86) (- target base))
    ((= Architecture AMD64) (- target base))
+   ((and ALIGNED (= Architecture ARMV7L))
+	(begin
+	  (set! ALIGNED #f)
+	  ;; Note: Branch displacements on ARM are in number of instructions to skip, basically.
+	  (when (not (= 0 (logand target 3)))
+		(begin
+		  (line_error)
+		  (write "error: Unaligned branch target: " (current-error-port))
+		  (write scratch (current-error-port))
+		  (write ", aborting" (current-error-port))
+		  (newline (current-error-port))
+		  (exit EXIT_FAILURE)))
+	  ;; The "fetch" stage already moved forward by 8 from the
+	  ;; beginning of the instruction because it is already
+	  ;; prefetching the next instruction.
+	  ;; Compensate for it by subtracting the space for
+	  ;; two instructions (including the branch instruction).
+	  ;; and the size of the aligned immediate.
+	  (- (ash (+ (- target base) (logand base 3)) -2) 2)))
+   ;; The size of the offset is 8 according to the spec but that value is
+   ;; based on the end of the immediate, which the documentation gets wrong
+   ;; and needs to be adjusted to the size of the immediate.
+   ;; Eg 1byte immediate => -8 + 1 = -7
+   ((= Architecture ARMV7L) (+ (- (- target base) 8) (logand base 3)))
+   ((= Architecture AARM64) (+ (- (- target base) 8) (logand base 3)))
    (#t (begin
 		 (write "Unknown Architecture, aborting before harm is done" (current-error-port))
 		 (newline (current-error-port))
 		 (exit EXIT_FAILURE)))))
 
+;; Common error
+(define (range-fail displacement bytes)
+  (begin
+	(write "A displacement of " (current-error-port))
+	(write displacement (current-error-port))
+	(write " does not fit in " (current-error-port))
+	(write bytes (current-error-port))
+	(write " bytes" (current-error-port))
+	(newline (current-error-port))
+	(exit EXIT_FAILURE)))
 
+;; Check to make sure the value will fit in the bytes
+(define (range-check displacement bytes)
+  (cond
+   ((= 4 bytes) #t)
+   ((= 3 bytes) (when (not (> 8388607 displacement -8388608)) (range-fail displacement bytes)))
+   ((= 2 bytes) (when (not (> 32767 displacement -32768)) (range-fail displacement bytes)))
+   ((= 1 bytes) (when (not (> 127 displacement -128)) (range-fail displacement bytes)))
+   (#t
+	(begin
+	  (write "Invalid number of bytes given" (current-error-port))
+	  (newline (current-error-port))
+	  (exit EXIT_FAILURE)))))
+
+;; Deal with the ugly details of writing pointers
 (define (outputPointer displacement bytes)
   (begin
-	; (range-check displacement bytes)
+	(range-check displacement bytes)
 	(set! displacement (logand #xFFFFFFFF displacement))
 	(if BigEndian
 		(begin
@@ -220,9 +280,21 @@
 			   (newline (current-error-port))
 			   (exit EXIT_FAILURE))))))))
 
-
 ;; Deal with arm family alignment restrictions
-(define (pad-to-align state) 3)
+(define (pad-to-align state)
+  (when (or (= Architecture ARMV7L) (= Architecture AARM64))
+	(begin
+	  (when (= 1 (logand ip 1))
+		(begin
+		  (set! ip (+ 1 ip))
+		  (when state (write-char (integer->char 0) output))))
+	  (when (= 2 (logand ip 2))
+		(begin
+		  (set! ip (+ 2 ip))
+		  (when state
+			(begin
+			  (write-char (integer->char 0) output)
+			  (write-char (integer->char 0) output))))))))
 
 
 ;; Drop entire line comments
@@ -253,6 +325,42 @@
 		   (newline (current-error-port))
 		   (exit EXIT_FAILURE))))))
 
+;; Deal with Octal input
+(define (octal char file)
+  (let ((c (char->integer char)))
+	(cond
+	 ((in_set char "01234567") (- c 48))
+	 ((in_set char "#;") (begin
+						   (line_comment file)
+						   -1))
+	 ((char=? char #\newline) (begin
+								(set! linenumber (+ 1 linenumber))
+								-1))
+	 ((in_set char " \t") -1)
+	 (#t (begin
+		   (display "Invalid input char: " (current-error-port))
+		   (display c (current-error-port))
+		   (newline (current-error-port))
+		   (exit EXIT_FAILURE))))))
+
+;; Deal with Binary input
+(define (binary char file)
+  (let ((c (char->integer char)))
+	(cond
+	 ((in_set char "01") (- c 48))
+	 ((in_set char "#;") (begin
+						   (line_comment file)
+						   -1))
+	 ((char=? char #\newline) (begin
+								(set! linenumber (+ 1 linenumber))
+								-1))
+	 ((in_set char " \t") -1)
+	 (#t (begin
+		   (display "Invalid input char: " (current-error-port))
+		   (display c (current-error-port))
+		   (newline (current-error-port))
+		   (exit EXIT_FAILURE))))))
+
 ;; Do the real work
 (define (process-byte char file state)
   (let ((value -1))
@@ -266,14 +374,51 @@
 			(if toggle
 				(begin
 				  (set! hold (+ (* 16 hold) value))
-				 ; (write hold)
-				 ; (newline)
-				  (when state (write-char (integer->char hold) output))
+				  (when state (write-char (integer->char (logand #xFF hold)) output))
 				  (set! ip (+ ip 1))
 				  (set! hold 0))
 				(set! hold value))
 			(set! toggle (not toggle))))))
-	 (#t (display "not implemented yet\n")))))
+	 ;; Deal with octal input
+	 ((= 8 ByteMode)
+	  (begin
+		(set! value (octal char file))
+		(when (<= 0 value)
+		  (cond
+		   ((= 2 toggle)
+			(begin
+			  (set! hold (+ (* 8 hold) value))
+			  (when state (write-char (integer->char (logand #xFF hold)) output))
+			  (set! ip (+ ip 1))
+			  (set! toggle 0)
+			  (set! hold 0)))
+		   ((= 1 toggle)
+			(begin
+			  (set! hold (+ (* 8 hold) value))
+			  (set! toggle 2)))
+		   (#t
+			(begin
+			  (set! hold value)
+			  (set! toggle 1)))))))
+	 ;; Deal with binary input
+	 ((= 2 ByteMode)
+	  (begin
+		(set! value (binary char file))
+		(when (<= 0 value)
+		  (if (= 7 toggle)
+			  (begin
+				(set! hold (+ (* 2 hold) value))
+				(when state (write-char (integer->char (logand #xFF hold)) output))
+				(set! ip (+ ip 1))
+				(set! toggle 0)
+				(set! hold 0))
+			  (begin
+				(set! hold (+ (* 2 hold) value))
+				(set! toggle (+ 1 toggle)))))))
+	 ;; Bail if we get anything else
+	 (#t (begin
+		   (display "Unknown ByteMode" (current-error-port))
+		   (exit EXIT_FAILURE))))))
 
 ;; Collect addresses of all labels
 (define (first-pass input)
@@ -285,7 +430,7 @@
 		  (begin
 			(set! c (read-char source-file))
 			(set! linenumber 1)
-			(set! toggle #f)
+			(set! toggle default-toggle)
 			(while (not (eof-object? c))
 				   (begin
 					 ;; Check for and deal with label
@@ -318,7 +463,7 @@
 		  (begin
 			(set! c (read-char source-file))
 			(set! linenumber 1)
-			(set! toggle #f)
+			(set! toggle default-toggle)
 			(set! hold 0)
 			(while (not (eof-object? c))
 				   (begin
@@ -348,8 +493,8 @@
 			  ((string= "--BigEndian" opt) (set! BigEndian #t))
 			  ((string= "--LittleEndian" opt) (set! BigEndian #f))
 			  ((string= "--exec_enable" opt) (set! exec_enable #t))
-			  ((string= "--binary" opt) (set! ByteMode 2))
-			  ((string= "--octal" opt) (set! ByteMode 8))
+			  ((string= "--binary" opt) (begin (set! ByteMode 2) (set! default-toggle 0)))
+			  ((string= "--octal" opt) (begin (set! ByteMode 8) (set! default-toggle 0)))
 			  ((string= "--architecture" opt) (set! args (set-arch! (cadr args) (cdr args))))
 			  ((string= "--BaseAddress" opt) (set! args (set-BaseAddress! (string->number (fixup-number (cadr args))) (cdr args))))
 			  ((or (string= "-f" opt) (string= "--file" opt)) (set! args (set-input-files! (cadr args) (cdr args))))
@@ -364,8 +509,8 @@
 	;; Get all of the labels
 	(set! ip Base_Address)
 	(first-pass input_files)
-	(display jump_table)
-	(newline)
+	;(display jump_table)
+	;(newline)
 	;; Fix all of the references
 	(set! ip Base_Address)
 	(second-pass input_files)
